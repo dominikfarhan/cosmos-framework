@@ -118,17 +118,6 @@ _DROP_FROM_QUANTIZED = ("vae2llm.", "llm2vae.")
 _FP8_DTYPES = {torch.float8_e4m3fn, getattr(torch, "float8_e5m2", torch.float8_e4m3fn)}
 FP8_MAX = 448.0
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale", ".input_scale_2", ".alpha", ".pre_quant_scale")
-_PACKED_EXPERT_KEY_SUFFIXES = tuple(
-    f"experts.{name}{suffix}"
-    for name in ("gate_up_proj", "down_proj")
-    for suffix in ("", ".weight_scale", ".input_scale")
-)
-
-
-def is_packed_expert_key(key: str) -> bool:
-    """True for a packed expert parameter or its scale, e.g. ``...experts.gate_up_proj.weight_scale``."""
-    return key.endswith(_PACKED_EXPERT_KEY_SUFFIXES)
-
 
 # Linears the diffusers checkpoint keeps in bf16 (never quantized), emitted in the
 # ModelOpt ``ignore`` list so a reasoning-path loader (vllm Cosmos3ForConditionalGeneration)
@@ -567,7 +556,9 @@ def assemble_output_dir(input_dir: Path, output_dir: Path, quantized_transformer
         dst.symlink_to(rel_src)
     weight_map = _write_root_weight_index(output_dir)
     has_packed_experts = any(
-        is_packed_expert_key(key) for key, file in weight_map.items() if file.startswith("transformer/")
+        key.endswith(("experts.gate_up_proj", "experts.down_proj"))
+        for key, file in weight_map.items()
+        if file.startswith("transformer/")
     )
     if not has_packed_experts:
         component_state = torch.load(target_transformer / "modelopt_state.pth", map_location="cpu", weights_only=False)
