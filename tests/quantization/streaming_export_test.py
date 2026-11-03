@@ -127,8 +127,8 @@ def test_quantize_packed_per_expert_scale():
     assert out[""].dtype == torch.float8_e4m3fn and out[""].shape == weight.shape
     torch.testing.assert_close(out[".weight_scale"], weight_amax / 448)
     torch.testing.assert_close(out[".input_scale"], torch.tensor(3.0 / 448))
-    # 32 is the FP8 E4M3 step in the top binade [256, 448].
-    assert ((out[""].float() * out[".weight_scale"] - weight.float()).abs() <= 32 * out[".weight_scale"]).all()
+    # Dequantization must recover each weight within FP8 rounding error: half the largest E4M3 step, 32 / 2.
+    assert ((out[""].float() * out[".weight_scale"] - weight.float()).abs() <= 16 * out[".weight_scale"]).all()
 
 
 @needs_cuda
