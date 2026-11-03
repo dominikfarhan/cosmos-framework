@@ -21,7 +21,6 @@ from safetensors.torch import load_file, save_file
 
 from cosmos_framework.inference.args import OmniSetupOverrides
 from cosmos_framework.inference.inference import OmniInference
-from cosmos_framework.utils import distributed
 
 
 def load_sharded_safetensors(checkpoint_dir: str | Path) -> dict[str, torch.Tensor]:
@@ -103,20 +102,17 @@ def _materialize_reasoner_visual_encoder(model) -> None:
         ensure_vision_tower()
 
 
-def load_transformer(model_name_or_path: str, *, sharded: bool = False):
+def load_transformer(model_name_or_path: str, *, world_size: int = 1, local_world_size: int = 1):
     """Load the Cosmos3 model through the supported ``OmniInference`` path.
 
-    ``sharded=True`` (under torchrun) shards the decoder blocks over every rank with FSDP2.
+    ``world_size > 1`` shards the decoder blocks over the ranks with FSDP2; the caller initializes
+    the process group.
     """
     input_dir = resolve_checkpoint_path(model_name_or_path)
     transformer_dir = input_dir / "transformer"
     if not transformer_dir.is_dir():
         raise FileNotFoundError(f"Expected {transformer_dir} (a diffusers-layout transformer/).")
 
-    world_size = local_world_size = 1
-    if sharded:
-        distributed.init()
-        world_size, local_world_size = int(os.environ["WORLD_SIZE"]), int(os.environ["LOCAL_WORLD_SIZE"])
     setup_args = OmniSetupOverrides(
         checkpoint_path=str(input_dir),
         output_dir=Path(gettempdir()) / "cosmos3-quantization-load",
