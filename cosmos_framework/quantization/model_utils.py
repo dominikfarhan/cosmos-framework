@@ -358,8 +358,39 @@ def refresh_modelopt_quantizer_state(model: nn.Module) -> None:
             update_quantize_metadata(model, config, metadata)
 
 
+def share_qkv_weight_amax(
+    model: nn.Module,
+    parent_regex: str = r"net\.language_model\.model\.layers\.(\d+)\.self_attn$",
+    keys: tuple[str, ...] = ("q_proj", "k_proj", "v_proj"),
+) -> int:
+    """Set the ``keys`` weight amax under every ``parent_regex`` module to their max; return the count.
+
+    The FSDP2-safe alternative to :func:`temporary_fuse_named_linears` for a fused runtime qkv_proj.
+    Their input amax must already be equal, because they read the same input.
+    """
+    count = 0
+    for name, parent in model.named_modules():
+        if not re.search(parent_regex, name):
+            continue
+        linears = [getattr(parent, key) for key in keys]
+        input_amax = linears[0].input_quantizer.amax
+        for key, linear in zip(keys, linears, strict=True):
+            if not torch.equal(linear.input_quantizer.amax, input_amax):
+                raise ValueError(
+                    f"{name}.{key} input amax differs from {name}.{keys[0]}; q/k/v must see the same input"
+                )
+        shared = torch.stack([linear.weight_quantizer.amax for linear in linears]).amax(dim=0)
+        for linear in linears:
+            linear.weight_quantizer.amax = shared
+        count += 1
+    if count == 0:
+        raise ValueError(f"no module matches {parent_regex!r}; no q/k/v amax shared")
+    return count
+
+
 __all__ = [
     "fuse_named_linears_context",
     "temporary_fuse_named_linears",
     "refresh_modelopt_quantizer_state",
+    "share_qkv_weight_amax",
 ]
