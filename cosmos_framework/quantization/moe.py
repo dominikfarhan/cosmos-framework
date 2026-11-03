@@ -3,7 +3,8 @@
 """ModelOpt FP8 calibration of the packed grouped-mm MoE experts.
 
 Calibrates and fake-quantizes the expert inputs through the wrapper's ``forward``. The FP8 expert
-weights, with one scale per expert, are computed by the streaming export from the BF16 source.
+weights, with one scale per expert, are computed from the BF16 source by
+:func:`~cosmos_framework.quantization.streaming_export.export_streaming`.
 This code does not support weight-only.
 
 Call :func:`register_packed_experts` before ``mtq.quantize``. Without it, ModelOpt's generic
