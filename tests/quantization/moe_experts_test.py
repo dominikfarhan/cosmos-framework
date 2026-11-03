@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
-"""ModelOpt FP8 calibration and export of the packed grouped-mm MoE experts.
+"""ModelOpt FP8 calibration of the packed grouped-mm MoE experts.
 
 The CPU tests replace ``torch._grouped_mm`` and Triton's ``_generate_permute_indices`` with
 PyTorch references.
@@ -17,18 +17,15 @@ from modelopt.torch.quantization.plugins.huggingface import _QuantFusedExperts
 from torch import nn
 
 import cosmos_framework.model.generator.moe.native as native_grouped_mm
-from cosmos_framework.inference.model import _diffusers_to_net_key
 from cosmos_framework.model.generator.moe.interface import MoEExperts
 from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeTextConfig
 from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.moe import (
     Qwen3VLMoeTextExpertsGroupedMm,
     Qwen3VLMoeTextExpertsNaive,
 )
-from cosmos_framework.quantization.export import Fp8DiffusersExporter, _remap_packed_experts, remap_framework_state_dict
 from cosmos_framework.quantization.moe import (
     QuantPackedExperts,
     assert_quantizers_calibrated,
-    export_packed_experts,
     register_packed_experts,
 )
 
@@ -117,18 +114,14 @@ def _forward_inputs(
     return hidden_states, topk_scores, expert_indices, num_tokens_per_expert, token_mask
 
 
-def _quantize(model: nn.Module, calibration: list[tuple] | None = None, *extra_cfg: dict) -> nn.Module:
+def _quantize(model: nn.Module, calibration: list[tuple] | None = None) -> nn.Module:
     register_packed_experts()
-    config = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
-    config["quant_cfg"] = [*config["quant_cfg"], *extra_cfg]
 
     def forward_loop(model: nn.Module) -> None:
         for inputs in calibration or [_forward_inputs()]:
             model.experts(*inputs)
-            if hasattr(model, "linear"):
-                model.linear(inputs[0])
 
-    return mtq.quantize(model, config, forward_loop)
+    return mtq.quantize(model, copy.deepcopy(mtq.FP8_DEFAULT_CFG), forward_loop)
 
 
 @pytest.fixture
@@ -223,109 +216,6 @@ def test_assert_quantizers_calibrated_rejects_uncalibrated_and_unwrapped():
     mtq.quantize(model, copy.deepcopy(mtq.FP8_DEFAULT_CFG), lambda m: m[0](torch.randn(2, 4)))
     with pytest.raises(ValueError, match="experts"):
         assert_quantizers_calibrated(model)
-
-
-@pytest.mark.usefixtures("reference_routing")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_export_packed_experts_layout(dtype):
-    model = Model().to(dtype)
-    model.experts.gate_up_proj.data[1] = 0
-    model.experts.down_proj.data[1] = 0
-    model = _quantize(model, [_forward_inputs(dtype=dtype)])
-
-    exported = export_packed_experts(model)
-
-    shapes = {"gate_up_proj": (4, 16, 16), "down_proj": (4, 8, 16)}
-    assert set(exported) == {
-        f"experts.{name}{suffix}" for name in shapes for suffix in ("", ".weight_scale", ".input_scale")
-    }
-    for name, shape in shapes.items():
-        weight = getattr(model.experts, name).float()
-        fp8 = exported[f"experts.{name}"]
-        weight_scale = exported[f"experts.{name}.weight_scale"]
-        input_scale = exported[f"experts.{name}.input_scale"]
-        assert fp8.dtype == torch.float8_e4m3fn and fp8.shape == shape
-        assert weight_scale.dtype == torch.float32 and weight_scale.shape == (4, 1, 1)
-        assert input_scale.dtype == torch.float32 and input_scale.shape == ()
-        weight_amax = weight.abs().amax(dim=(1, 2), keepdim=True)
-        torch.testing.assert_close(weight_scale, torch.where(weight_amax == 0, 1.0, weight_amax / 448))
-        assert weight_scale[1].item() == 1.0  # The all-zero expert gets a unit scale, not 0.
-        assert torch.isfinite(fp8[1].float()).all() and (fp8[1].float() == 0).all()
-        amax = getattr(model.experts, f"{name}_input_quantizer").amax.float()
-        torch.testing.assert_close(input_scale, amax / 448)
-        # 32 is the FP8 E4M3 step in the top binade [256, 448].
-        assert ((fp8.float() * weight_scale - weight).abs() <= 32 * weight_scale).all()
-        assert all(
-            tensor.is_contiguous() and tensor.device.type == "cpu" for tensor in (fp8, weight_scale, input_scale)
-        )
-
-
-@pytest.mark.usefixtures("reference_routing")
-def test_export_skips_dense_and_disabled_experts_and_rejects_mixed():
-    dense = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
-    mtq.quantize(dense, copy.deepcopy(mtq.FP8_DEFAULT_CFG), lambda m: m[0](torch.randn(2, 4)))
-    assert export_packed_experts(dense) == {}  # Uncalibrated, but dense models skip the check.
-
-    # A coverage skip disables the experts before calibration, so they never get an amax. The
-    # linear keeps a weight to quantize: ModelOpt (>= 0.47) refuses a config with none enabled.
-    skipped = Model()
-    skipped.linear = nn.Linear(16, 16)
-    skipped = _quantize(skipped, None, {"quantizer_name": "*experts*", "enable": False})
-    assert isinstance(skipped.experts, QuantPackedExperts)
-    assert export_packed_experts(skipped) == {}
-
-    mixed = _quantize(Model())
-    mixed.experts.down_proj_input_quantizer.disable()
-    with pytest.raises(ValueError, match="experts"):
-        export_packed_experts(mixed)
-
-
-@pytest.mark.usefixtures("reference_routing")
-def test_export_rejects_non_per_expert_fp8():
-    per_channel_inputs = _quantize(Model(), None, {"quantizer_name": "*input_quantizer", "cfg": {"axis": 0}})
-    assert per_channel_inputs.experts.gate_up_proj_input_quantizer.amax.numel() > 1
-    with pytest.raises(ValueError, match="per-expert FP8") as error:
-        export_packed_experts(per_channel_inputs)
-    assert "experts" in str(error.value) and "gate_up_proj_input_quantizer" in str(error.value)
-
-    int8 = _quantize(Model(), None, {"quantizer_name": "*experts*", "cfg": {"num_bits": 8}})
-    assert int8.experts.down_proj_input_quantizer.num_bits == 8
-    with pytest.raises(ValueError, match="per-expert FP8") as error:
-        export_packed_experts(int8)
-    assert "num_bits=8" in str(error.value)
-
-
-def test_remap_packed_expert_scales():
-    prefix = "layers.0.mlp.experts"
-    bf16 = {f"{prefix}.gate_up_proj": torch.zeros(4, 16, 16, dtype=torch.bfloat16)}
-    net_prefix = _diffusers_to_net_key(f"{prefix}.gate_up_proj", "transformer/weights.safetensors")
-    exported = {net_prefix + suffix: torch.ones(1) for suffix in ("", ".weight_scale", ".input_scale")}
-    expected = {f"{prefix}.gate_up_proj{suffix}" for suffix in ("", ".weight_scale", ".input_scale")}
-
-    assert set(remap_framework_state_dict(exported, bf16)) == expected
-    assert set(_remap_packed_experts(exported, bf16)) == expected
-    exported["net.unknown.experts.down_proj.weight_scale"] = torch.ones(1)
-    with pytest.raises(ValueError, match=r"net\.unknown\.experts\.down_proj\.weight_scale"):
-        _remap_packed_experts(exported, bf16)
-
-
-@pytest.mark.usefixtures("reference_routing")
-def test_overlay_accepts_packed_fp8_experts():
-    model = _quantize(Model())
-    bf16 = {
-        f"layers.0.mlp.{name}": value.bfloat16() for name, value in model.experts.named_parameters(prefix="experts")
-    }
-    quantized = {f"layers.0.mlp.{name}": value for name, value in export_packed_experts(model).items()}
-
-    merged = Fp8DiffusersExporter().overlay(bf16, quantized)
-
-    for key, value in quantized.items():
-        assert torch.equal(merged[key].float(), value.float()) and merged[key].dtype == value.dtype
-    assert merged["layers.0.mlp.experts.gate_up_proj"].dtype == torch.float8_e4m3fn
-    assert not any("_quantizer." in key for key in merged)
-    quantized["layers.0.mlp.experts.down_proj"] = quantized["layers.0.mlp.experts.down_proj"][:, :4]
-    with pytest.raises(ValueError, match="shape mismatch"):
-        Fp8DiffusersExporter().overlay(bf16, quantized)
 
 
 @pytest.mark.gpus(1)

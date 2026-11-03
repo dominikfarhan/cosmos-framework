@@ -1,18 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
-"""ModelOpt FP8 quantization of the packed grouped-mm MoE experts.
+"""ModelOpt FP8 calibration of the packed grouped-mm MoE experts.
 
-Calibrates and fake-quantizes the expert inputs through the wrapper's ``forward``, and quantizes
-the expert weights (with one scale per expert) directly in :func:`export_packed_experts`.
+Calibrates and fake-quantizes the expert inputs through the wrapper's ``forward``. The FP8 expert
+weights, with one scale per expert, are computed by the streaming export from the BF16 source.
 This code does not support weight-only.
 
-How to run quantization: call :func:`register_packed_experts` before ``mtq.quantize`` (and before
-restoring a saved ModelOpt state), then export with
-:func:`~cosmos_framework.quantization.export.export_quantized_transformer`, which writes the
-experts via :func:`export_packed_experts`.
-
-Without the registration, ModelOpt's generic ``_QuantFusedExperts`` claims these experts and,
-since it only intercepts ``F.linear`` and they run ``torch._grouped_mm``, quantizes nothing.
+Call :func:`register_packed_experts` before ``mtq.quantize``. Without it, ModelOpt's generic
+``_QuantFusedExperts`` claims these experts and, since it only intercepts ``F.linear`` and they
+run ``torch._grouped_mm``, quantizes nothing.
 """
 
 from __future__ import annotations
@@ -23,7 +19,6 @@ from torch import nn
 
 from cosmos_framework.model.generator.moe.interface import MoEExperts
 from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.moe import Qwen3VLMoeTextExpertsGroupedMm
-from cosmos_framework.quantization.export import FP8_MAX
 
 _PACKED_EXPERT_TYPES = (Qwen3VLMoeTextExpertsGroupedMm, MoEExperts)
 
@@ -89,10 +84,6 @@ def register_packed_experts() -> None:
         QuantModuleRegistry.register(pending)(QuantPackedExperts)
 
 
-def has_packed_experts(model: nn.Module) -> bool:
-    return any(isinstance(module, _PACKED_EXPERT_TYPES) for module in model.modules())
-
-
 def assert_quantizers_calibrated(model: nn.Module) -> None:
     """Fail export instead of writing a missing or zero scale for an enabled quantizer."""
     problems = []
@@ -116,52 +107,3 @@ def assert_quantizers_calibrated(model: nn.Module) -> None:
     if problems:
         shown = "; ".join(problems[:10])
         raise ValueError(f"{len(problems)} quantizer problem(s), first {min(len(problems), 10)}: {shown}")
-
-
-_PACKED_EXPERT_QUANTIZERS = (
-    "gate_up_proj_input_quantizer",
-    "down_proj_input_quantizer",
-)
-
-
-def _check_per_expert_fp8(name: str, module: QuantPackedExperts) -> None:
-    """Refuse any input quantizer layout but FP8 E4M3 with a scalar amax."""
-    for quantizer_name in _PACKED_EXPERT_QUANTIZERS:
-        quantizer = getattr(module, quantizer_name)
-        amax_shape = tuple(quantizer.amax.shape)
-        if quantizer.num_bits != (4, 3) or quantizer.block_sizes:
-            found = f"num_bits={quantizer.num_bits}, block_sizes={quantizer.block_sizes}"
-        elif quantizer.amax.numel() == 1:
-            continue
-        else:
-            found = f"amax shape {amax_shape}, expected a single element"
-        raise ValueError(f"{name}.{quantizer_name}: {found}; packed-expert export supports per-expert FP8 only")
-
-
-def export_packed_experts(net: nn.Module) -> dict[str, torch.Tensor]:
-    """FP8 packed experts in the source layout, with per-expert weight scales and scalar input scales."""
-    if not has_packed_experts(net):
-        return {}  # Dense models export exactly as before, without the calibration check.
-    assert_quantizers_calibrated(net)
-    exported = {}
-    for name, module in net.named_modules():
-        if not isinstance(module, QuantPackedExperts):
-            continue
-        enabled = [getattr(module, quantizer).is_enabled for quantizer in _PACKED_EXPERT_QUANTIZERS]
-        if not any(enabled):
-            continue  # Skipped by the coverage filter; the experts stay BF16 from the source.
-        if not all(enabled):
-            raise ValueError(f"{name or 'experts'}: packed-expert quantizers are only partly enabled: {enabled}")
-        _check_per_expert_fp8(name or "experts", module)
-        for param_name in ("gate_up_proj", "down_proj"):
-            # BF16 models keep BF16 amax; the scales are FP32 on disk.
-            param = getattr(module, param_name).detach()
-            weight_amax = param.abs().amax(dim=(1, 2), keepdim=True).float()
-            weight_scale = torch.where(weight_amax == 0, 1.0, weight_amax / FP8_MAX)  # [num_experts,1,1]
-            fp8 = (param.float() / weight_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-            input_amax = getattr(module, f"{param_name}_input_quantizer").amax.detach().float()
-            key = f"{name}.{param_name}" if name else param_name
-            exported[key] = fp8.contiguous().cpu()
-            exported[f"{key}.weight_scale"] = weight_scale.contiguous().cpu()
-            exported[f"{key}.input_scale"] = (input_amax / FP8_MAX).reshape(()).contiguous().cpu()
-    return exported
