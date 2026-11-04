@@ -121,7 +121,9 @@ def _quantize(model: nn.Module, calibration: list[tuple] | None = None) -> nn.Mo
         for inputs in calibration or [_forward_inputs()]:
             model.experts(*inputs)
 
-    return mtq.quantize(model, copy.deepcopy(mtq.FP8_DEFAULT_CFG), forward_loop)
+    config = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    config["quant_cfg"].append({"quantizer_name": "*weight_quantizer", "enable": False})
+    return mtq.quantize(model, config, forward_loop)
 
 
 @pytest.fixture
