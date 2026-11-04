@@ -15,6 +15,7 @@ from modelopt.torch.export.unified_export_hf import _process_quantized_modules
 from safetensors.torch import load_file, save_file
 from torch import nn
 
+from cosmos_framework.quantization import export_fp8_moe
 from cosmos_framework.quantization.export import Fp8DiffusersExporter, add_diffusion_step_policy
 from cosmos_framework.quantization.streaming_export import (
     INDEX_NAME,
@@ -277,3 +278,34 @@ def test_export_streaming_failure_leaves_no_output(checkpoint, tmp_path):
 
     assert not output.exists()
     assert sorted(path.name for path in tmp_path.iterdir() if path.name.startswith(".")) == []
+
+
+def _save_moe_state(checkpoint, calibrated_root) -> dict:
+    record = {
+        "source": {"resolved_path": str(calibrated_root.resolve())},
+        "recipe": {"format": "fp8"},
+        "calibration": {"target_pattern": TARGET.pattern, "expected_targets": 2},
+    }
+    torch.save({**checkpoint.state, "record": record}, checkpoint.calib)
+    return record
+
+
+@needs_cuda
+def test_export_fp8_moe_writes_checkpoint_and_metadata(checkpoint, tmp_path):
+    record = _save_moe_state(checkpoint, checkpoint.root)
+    output = tmp_path / "fp8"
+
+    export_fp8_moe(model_name_or_path=checkpoint.root, calibration_state=checkpoint.calib, output_dir=output)
+
+    down_proj = load_file(output / "transformer" / "model-2.safetensors")["layers.0.mlp.experts.down_proj"]
+    assert down_proj.dtype == torch.float8_e4m3fn
+    metadata = json.loads((output / "quantization_metadata.json").read_text())
+    assert metadata == {**record, "recipe": {"format": "fp8", "mixed_precision_steps": 3}}
+
+
+def test_export_fp8_moe_refuses_other_checkpoint(checkpoint, tmp_path):
+    _save_moe_state(checkpoint, tmp_path / "other")
+    output = tmp_path / "fp8"
+    with pytest.raises(ValueError, match="calibration state is for checkpoint"):
+        export_fp8_moe(model_name_or_path=checkpoint.root, calibration_state=checkpoint.calib, output_dir=output)
+    assert not output.exists()
