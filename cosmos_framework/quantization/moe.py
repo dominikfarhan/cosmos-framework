@@ -9,11 +9,16 @@ This code does not support weight-only.
 
 Call :func:`register_packed_experts` before ``mtq.quantize``. Without it, ModelOpt's generic
 ``_QuantFusedExperts`` claims these experts and, since it only intercepts ``F.linear`` and they
-run ``torch._grouped_mm``, quantizes nothing.
+run ``torch._grouped_mm``, quantizes nothing. :data:`MOE_FP8_TARGET` and
+:func:`build_moe_quant_config` select the modules quantized in an MoE checkpoint.
 """
 
 from __future__ import annotations
 
+import copy
+import re
+
+import modelopt.torch.quantization as mtq
 import torch
 from modelopt.torch.quantization.nn import QuantModule, QuantModuleRegistry, TensorQuantizer
 from torch import nn
@@ -22,6 +27,26 @@ from cosmos_framework.model.generator.moe.interface import MoEExperts
 from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.moe import Qwen3VLMoeTextExpertsGroupedMm
 
 _PACKED_EXPERT_TYPES = (Qwen3VLMoeTextExpertsGroupedMm, MoEExperts)
+
+# Framework module names quantized in an MoE checkpoint; everything else stays BF16.
+MOE_FP8_TARGET = re.compile(
+    r"net\.language_model\.model\.layers\.\d+\."
+    r"(?:self_attn\.(?:[qkvo]_proj|[qkvo]_proj_moe_gen)"
+    r"|mlp(?:_moe_gen)?\.experts"
+    r"|mlp_moe_gen\.shared_expert\.(?:gate_up_proj|down_proj))"
+)
+_TARGETS_PER_LAYER = 10
+_TARGETS_PER_SHARED_EXPERT = 2
+
+
+def count_moe_fp8_targets(model: nn.Module) -> int:
+    """How many modules MOE_FP8_TARGET should match, counted from the model's layers."""
+    count = 0
+    for i, layer in enumerate(model.net.language_model.model.layers):
+        if not hasattr(layer.mlp_moe_gen, "experts"):
+            raise ValueError(f"layer {i} has a dense MLP; only MoE layers are supported")
+        count += _TARGETS_PER_LAYER + _TARGETS_PER_SHARED_EXPERT * (layer.mlp_moe_gen.shared_expert is not None)
+    return count
 
 
 class QuantPackedExperts(QuantModule):
@@ -108,3 +133,32 @@ def assert_quantizers_calibrated(model: nn.Module) -> None:
     if problems:
         shown = "; ".join(problems[:10])
         raise ValueError(f"{len(problems)} quantizer problem(s), first {min(len(problems), 10)}: {shown}")
+
+
+def build_moe_quant_config(model: nn.Module, target: re.Pattern = MOE_FP8_TARGET) -> dict:
+    """``FP8_DEFAULT_CFG`` with every quantizer outside the ``target`` modules disabled."""
+    config = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    targets = [name for name, _ in model.named_modules() if target.fullmatch(name)]
+    for name, module in model.named_modules():
+        if module not in QuantModuleRegistry or target.fullmatch(name):
+            continue
+        if any(t.startswith(name + ".") for t in targets):
+            # An ancestor of a target: disable only its own quantizers, not the subtree.
+            patterns = [f"{name}.{q}_quantizer" for q in ("input", "weight", "output")]
+        else:
+            patterns = [f"{name}.*"]
+        config["quant_cfg"] += [{"quantizer_name": p, "enable": False} for p in patterns]
+    return config
+
+
+def assert_target_coverage(model: nn.Module, target: re.Pattern = MOE_FP8_TARGET) -> None:
+    """The modules owning an enabled quantizer are exactly the ``target`` modules."""
+    enabled = {
+        name
+        for name, module in model.named_modules()
+        if any(isinstance(q, TensorQuantizer) and q.is_enabled for q in module.children())
+    }
+    targets = {name for name, _ in model.named_modules() if target.fullmatch(name)}
+    if enabled != targets:
+        extra, missing = sorted(enabled - targets), sorted(targets - enabled)
+        raise ValueError(f"coverage mismatch: extra {extra[:10]}, missing {missing[:10]}")

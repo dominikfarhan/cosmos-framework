@@ -10,15 +10,19 @@ with a different :class:`Sampler`.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
 import modelopt.torch.quantization as mtq
 import torch
+import torch.distributed as dist
 
 from . import calibration as _calib
 from . import export as _export
+from .calibration_state import load_calibration_state, save_calibration_state
 from .checkpoint_io import (
     load_legacy_scheduler,
     load_sharded_safetensors,
@@ -27,7 +31,16 @@ from .checkpoint_io import (
     save_sharded_safetensors,
 )
 from .metadata import collect_quantization_metadata, write_quantization_metadata
-from .model_utils import temporary_fuse_named_linears
+from .model_utils import share_qkv_weight_amax, temporary_fuse_named_linears
+from .moe import (
+    MOE_FP8_TARGET,
+    assert_quantizers_calibrated,
+    assert_target_coverage,
+    build_moe_quant_config,
+    count_moe_fp8_targets,
+    register_packed_experts,
+)
+from .streaming_export import export_streaming
 
 FP8_E4M3_MAX = 448.0
 
@@ -264,6 +277,133 @@ def quantize_fp8_checkpoint(
     return (output_dir, model) if keep_model else output_dir
 
 
+def calibrate_fp8_moe(
+    *,
+    model_name_or_path: str | Path,
+    calibration_state: str | Path,
+    sampler: Sampler,
+    shape: Shape,
+    prompts: list[str] | None = None,
+    num_samples: int = 8,
+    negative_prompt: str = "",
+    fps: float = 24.0,
+    seed: int = 0,
+    target: re.Pattern = MOE_FP8_TARGET,
+) -> None:
+    """Calibrate an MoE checkpoint for FP8 sharded over the torchrun ranks; rank 0 writes the state.
+
+    The caller initializes the process group and destroys it afterwards. Every rank calibrates t2v
+    on the same ``prompts`` (default: the first ``num_samples`` dense-path prompts). The packed
+    experts and every ``target`` module are quantized; the UND q/k/v share one weight amax. Write
+    the checkpoint with :func:`export_fp8_moe`.
+    """
+    input_dir = resolve_checkpoint_path(str(model_name_or_path))
+    register_packed_experts()
+    model, _ = load_transformer(
+        str(model_name_or_path),
+        world_size=dist.get_world_size(),
+        local_world_size=int(os.environ["LOCAL_WORLD_SIZE"]),
+    )
+    # A renamed module would fall out of the regex and silently stay BF16.
+    # We check that the number of modules that match the regex equals the expected count.
+    expected_targets = count_moe_fp8_targets(model)
+    num_targets = sum(1 for name, _ in model.named_modules() if target.fullmatch(name))
+    if num_targets != expected_targets:
+        raise ValueError(f"{num_targets} modules match the target, expected {expected_targets}")
+
+    prompts = prompts if prompts is not None else _calib.prepare_calibration_prompts(num_samples=num_samples)
+    scheduler = model.fixed_step_sampler or model.sampler
+    explicit_sigmas = sampler.explicit_sigmas or _calib.resolve_distilled_sigmas(input_dir)
+    metadata = collect_quantization_metadata(
+        source=model_name_or_path,
+        input_dir=input_dir,
+        recipe={
+            "format": "fp8",
+            "profile": "t2v",
+            "shape": asdict(shape),
+            "sampler": asdict(sampler),
+            "scheduler_class": f"{type(scheduler).__module__}.{type(scheduler).__qualname__}",
+            "resolved_explicit_sigmas": explicit_sigmas,
+            "num_samples": len(prompts),
+            "quant_algo": "max",
+            "seed": seed,
+            "negative_prompt": negative_prompt,
+            "fps": fps,
+            "qkv_shared_amax": True,
+        },
+        prompts=prompts,
+    )
+    metadata["environment"]["torch_cuda"] = torch.version.cuda
+    metadata["calibration"] = {
+        "target_pattern": target.pattern,
+        "expected_targets": expected_targets,
+        "world_size": dist.get_world_size(),
+    }
+
+    calibrate = _calib.make_forward_loop(
+        vae=_StubVAE(),
+        scheduler=scheduler,
+        prompts=prompts,
+        num_inference_steps=sampler.num_inference_steps,
+        height=shape.height,
+        width=shape.width,
+        num_frames=shape.num_frames,
+        guidance_scale=sampler.guidance_scale,
+        frame_rate=fps,
+        flow_shift=sampler.flow_shift,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        sigma_max=sampler.sigma_max,
+        use_karras_sigmas=sampler.use_karras_sigmas,
+        use_flow_sigmas=sampler.use_flow_sigmas,
+        explicit_sigmas=explicit_sigmas,
+    )
+
+    def forward_loop(model):
+        assert_target_coverage(model, target)  # before the first calibration forward
+        calibrate(model)
+
+    quant_cfg = build_moe_quant_config(model, target)
+    mtq.quantize(model, quant_cfg, forward_loop)
+    assert_quantizers_calibrated(model)
+    print(f"[quant] shared the q/k/v weight amax of {share_qkv_weight_amax(model)} attention blocks")
+    save_calibration_state(model, calibration_state, quant_config=quant_cfg, record=metadata)
+    dist.barrier()
+    if dist.get_rank() == 0:
+        print(f"[done] {calibration_state}")
+
+
+def export_fp8_moe(
+    *,
+    model_name_or_path: str | Path,
+    calibration_state: str | Path,
+    output_dir: str | Path,
+    mixed_precision_steps: int = 3,
+) -> Path:
+    """Write the FP8 drop-in checkpoint from :func:`calibrate_fp8_moe`'s state on one GPU.
+
+    Streams the BF16 source shard by shard without building the model; the target modules and
+    their count come from the calibration state, which must be from the same checkpoint.
+    """
+    input_dir, output_dir = resolve_checkpoint_path(str(model_name_or_path)), Path(output_dir)
+    metadata = load_calibration_state(calibration_state)["record"]
+    calibrated = Path(metadata["source"]["resolved_path"])
+    if calibrated.name != input_dir.resolve().name:
+        raise ValueError(f"calibration state is for checkpoint {calibrated}, not {input_dir.resolve()}")
+    export_streaming(
+        model_name_or_path,
+        calibration_state,
+        output_dir,
+        target=re.compile(metadata["calibration"]["target_pattern"]),
+        expected_targets=metadata["calibration"]["expected_targets"],
+        mixed_precision_steps=mixed_precision_steps,
+    )
+    metadata["recipe"]["mixed_precision_steps"] = mixed_precision_steps
+    write_quantization_metadata(output_dir, metadata)
+    print(f"[done] {output_dir}")
+    return output_dir
+
+
 def diffusers_input_scales(model) -> dict[str, torch.Tensor]:
     """Extract the calibrated per-module ``input_scale``s, keyed like the diffusers
     checkpoint (``scale = amax / 448``). Handy for bit-identity checks vs. a reference.
@@ -287,6 +427,8 @@ __all__ = [
     "SAMPLER_IMAGE_BASE",
     "SAMPLER_DISTILLED",
     "quantize_fp8_checkpoint",
+    "calibrate_fp8_moe",
+    "export_fp8_moe",
     "diffusers_input_scales",
     "load_transformer",
     "load_legacy_scheduler",
